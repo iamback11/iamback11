@@ -84,8 +84,15 @@ index=ad source="WinEventLog:System" EventCode=7045
 | table _time host Service_Name Service_File_Name Service_Account
 ```
 
+Same thing from the Security log (4697 = service installed), which we also collect:
+
 ```spl
-index=ad source="WinEventLog:Security" EventCode=4698 powershell
+index=ad source="WinEventLog:Security" EventCode=4697
+| table _time host Account_Name Service_Name Service_File_Name Service_Account
+```
+
+```spl
+index=ad source="WinEventLog:Security" (EventCode=4698 OR EventCode=4702) powershell
 | table _time host Account_Name Task_Name Message
 ```
 
@@ -93,6 +100,28 @@ index=ad source="WinEventLog:Security" EventCode=4698 powershell
 index=ad ((source="WinEventLog:Security" EventCode=1102) OR (source="WinEventLog:System" EventCode=104))
 | table _time host EventCode Account_Name Message
 ```
+
+### F. Kerberoasting (Invoke-Kerberoast / Rubeus) – 4769 with RC4 tickets
+
+```spl
+index=ad source="WinEventLog:Security" EventCode=4769 Ticket_Encryption_Type=0x17
+  Service_Name!="*$" Service_Name!="krbtgt"
+| bin _time span=10m
+| stats dc(Service_Name) as services values(Service_Name) as service_list values(Client_Address) as src by _time Account_Name
+| where services >= 3
+```
+
+### G. DCSync (Mimikatz `lsadump::dcsync` from a non-DC) – 4662 replication rights
+
+```spl
+index=ad source="WinEventLog:Security" EventCode=4662
+  ("1131f6aa-9c07-11d1-f79f-00c04fc2dcd2" OR "1131f6ad-9c07-11d1-f79f-00c04fc2dcd2" OR "89e95b76-444d-4c62-991a-0facbeda640c")
+| eval user=mvindex(Account_Name,0)
+| where NOT like(user, "%$")
+| table _time host user Message
+```
+
+Machine accounts (`DC01$`) replicating is normal; a user account doing it is not.
 
 ### What we still can't see without 4104 / Sysmon
 
