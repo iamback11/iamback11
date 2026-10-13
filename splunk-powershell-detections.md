@@ -6,6 +6,101 @@ Each one can be saved as an alert.
 
 ---
 
+## Alerts for our environment (`index=ad`, Security event 4688)
+
+What we have today: Windows `Security` + `System` logs from the servers in `index=ad`, with process creation
+(4688) **and command line** enabled. No PowerShell/Operational (4104) and no Sysmon yet. Workstations are not
+in `index=ad` (use Cisco AMP for those). `CompatTelRunner.exe` (Windows telemetry) is the only normal PowerShell
+source seen in 7 days, so it is excluded.
+
+### A. Malicious PowerShell command line (main alert)
+
+Tags each PowerShell launch with the reasons it looks bad. Alert = any critical reason, or 2+ reasons.
+
+```spl
+index=ad EventCode=4688 (New_Process_Name="*\\powershell.exe" OR New_Process_Name="*\\pwsh.exe")
+  Creator_Process_Name!="*\\CompatTelRunner.exe"
+| eval user=mvindex(Account_Name,0), c=lower(Process_Command_Line)
+| eval reasons=mvappend(
+    if(match(c, "\s[-/]e(n(c(o(d(e(d(c(o(m(m(a(n(d)?)?)?)?)?)?)?)?)?)?)?)?)?\s+[a-z0-9+/=]{20,}"), "encoded command", null()),
+    if(match(c, "downloadstring|downloadfile|invoke-webrequest|iwr\s|invoke-restmethod|irm\s|net\.webclient|start-bitstransfer"), "download", null()),
+    if(match(c, "iex\s*\(|iex\s|invoke-expression"), "invoke-expression", null()),
+    if(match(c, "frombase64string"), "base64 decode", null()),
+    if(match(c, "\s[-/]w(i\w*)?\s+(hidden|h|1)\b"), "hidden window", null()),
+    if(match(c, "\s[-/](ep|ex\w*)\s+(bypass|unrestricted)"), "execution policy bypass", null()),
+    if(match(c, "amsiutils|amsiinitfailed|set-mppreference|add-mppreference|disablerealtimemonitoring"), "CRITICAL AMSI/Defender tampering", null()),
+    if(match(c, "security\.cryptography|aesmanaged|createencryptor|cryptostream"), "CRITICAL encryption code", null()),
+    if(match(c, "win32_shadowcopy|vssadmin|wbadmin|bcdedit"), "CRITICAL shadow copy/backup", null()),
+    if(match(c, "mimikatz|sekurlsa|comsvcs|minidump|lsass"), "CRITICAL credential dumping", null()),
+    if(match(c, "\s[-/]v(e\w*)?\s+2(\.0)?\b"), "CRITICAL powershell v2 downgrade", null()),
+    if(len(c) > 1000, "very long command", null()))
+| eval score=mvcount(reasons)
+| where like(mvjoin(reasons, ","), "%CRITICAL%") OR score>=2
+| table _time host user Creator_Process_Name Process_Command_Line reasons score
+| sort - score
+```
+
+Hunting version: change the `where` line to `| where score>=1` and run over 7–30 days.
+
+### B. Shadow copy / backup deletion (ransomware precursor, any process)
+
+```spl
+index=ad EventCode=4688
+  (New_Process_Name="*\\vssadmin.exe" OR New_Process_Name="*\\wmic.exe" OR New_Process_Name="*\\wbadmin.exe"
+   OR New_Process_Name="*\\bcdedit.exe" OR New_Process_Name="*\\powershell.exe" OR New_Process_Name="*\\pwsh.exe")
+| eval user=mvindex(Account_Name,0), c=lower(Process_Command_Line)
+| where match(c, "delete\s+shadows|resize\s+shadowstorage|shadowcopy\s+delete|win32_shadowcopy|delete\s+(catalog|systemstatebackup)|recoveryenabled\s+no|ignoreallfailures")
+| table _time host user Creator_Process_Name Process_Command_Line
+```
+
+### C. PowerShell / cmd started by a suspicious parent (web shell, SQL, Office, scripts)
+
+```spl
+index=ad EventCode=4688 (New_Process_Name="*\\powershell.exe" OR New_Process_Name="*\\pwsh.exe" OR New_Process_Name="*\\cmd.exe")
+  (Creator_Process_Name="*\\w3wp.exe" OR Creator_Process_Name="*\\sqlservr.exe" OR Creator_Process_Name="*\\winword.exe"
+   OR Creator_Process_Name="*\\excel.exe" OR Creator_Process_Name="*\\outlook.exe" OR Creator_Process_Name="*\\mshta.exe"
+   OR Creator_Process_Name="*\\wscript.exe" OR Creator_Process_Name="*\\cscript.exe" OR Creator_Process_Name="*\\rundll32.exe"
+   OR Creator_Process_Name="*\\regsvr32.exe" OR Creator_Process_Name="*\\wmiprvse.exe")
+| eval user=mvindex(Account_Name,0)
+| table _time host user Creator_Process_Name New_Process_Name Process_Command_Line
+```
+
+`wmiprvse.exe` = remote WMI execution; if SCCM/monitoring tools cause noise, exclude them by command line.
+
+### D. Credential dumping tools (any process)
+
+```spl
+index=ad EventCode=4688
+| eval user=mvindex(Account_Name,0), c=lower(Process_Command_Line)
+| where match(c, "comsvcs(\.dll)?[, ]+#?\s*(24|minidump)|procdump.*lsass|sekurlsa|mimikatz|reg(\.exe)?\s+save\s+hklm\\\\(sam|security|system)|ntdsutil.*(ifm|create\s+full)")
+| table _time host user Creator_Process_Name New_Process_Name Process_Command_Line
+```
+
+### E. Service / scheduled task running PowerShell, and log clearing
+
+```spl
+index=ad source="WinEventLog:System" EventCode=7045
+| search Service_File_Name="*powershell*" OR Service_File_Name="*pwsh*" OR Service_File_Name="*cmd*/c*" OR Service_File_Name="*-enc*" OR Service_File_Name="*ADMIN$*" OR Service_File_Name="*\\Temp\\*"
+| table _time host Service_Name Service_File_Name Service_Account
+```
+
+```spl
+index=ad source="WinEventLog:Security" EventCode=4698 powershell
+| table _time host Account_Name Task_Name Message
+```
+
+```spl
+index=ad ((source="WinEventLog:Security" EventCode=1102) OR (source="WinEventLog:System" EventCode=104))
+| table _time host EventCode Account_Name Message
+```
+
+### What we still can't see without 4104 / Sysmon
+
+The decoded content of `-EncodedCommand` scripts, scripts run from `.ps1` files, mass file encryption by
+PowerShell, and anything on workstations. Enabling Script Block Logging (section 0) unlocks detections 2, 3, 6 and 7a below.
+
+---
+
 ## 0. Prerequisites (do this first or most detections see nothing)
 
 | Log source | Event | How to enable | Typical sourcetype |
