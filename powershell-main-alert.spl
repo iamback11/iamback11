@@ -1,0 +1,30 @@
+index=ad (
+   (EventCode=4688 (New_Process_Name="*\\powershell.exe" OR New_Process_Name="*\\pwsh.exe" OR New_Process_Name="*\\powershell_ise.exe")
+      NOT Creator_Process_Name="*\\CompatTelRunner.exe"
+      NOT Creator_Process_Name IN ("*\\CcmExec.exe", "*\\IntuneManagementExtension.exe", "*\\AgentExecutor.exe"))
+   OR
+   (EventCode=4104 NOT Path="C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Modules\\*" NOT Path="C:\\Program Files\\WindowsPowerShell\\Modules\\*")
+)
+| eval user=coalesce(mvindex(Account_Name,0), UserID, SubjectUserName, "Unknown"),
+       command=coalesce(Process_Command_Line, ScriptBlockText),
+       c=lower(command),
+       log_source=if(EventCode==4688, "Process Creation", "Script Block")
+| eval reasons=mvappend(
+    if(match(c, "\s[-/]e(c|n\w*)?\s+[a-z0-9+/=]{20,}"), "encoded command", null()),
+    if(match(c, "downloadstring|downloadfile|invoke-webrequest|\biwr\b|\binvoke-restmethod|\birm\b|net\.webclient|start-bitstransfer|curl\s|wget\s"), "download", null()),
+    if(match(c, "iex\s*\(|\biex\b|invoke-expression"), "invoke-expression", null()),
+    if(match(c, "frombase64string|io\.compression|gzipstream|decompress"), "obfuscation / decoding", null()),
+    if(match(c, "\s[-/]w(i\w*)?\s+(hidden|h|1)\b"), "hidden window", null()),
+    if(match(c, "\s[-/](ep|ex\w*)\s+(bypass|unrestricted)"), "execution policy bypass", null()),
+    if(match(c, "\s[-/]noni(n\w*)?\b"), "non-interactive mode", null()),
+    if(match(c, "amsiutils|amsiinitfailed|set-mppreference.*-disable\w+\s+\$?(true|1)|add-mppreference.*-exclusion|fltmc(\.exe)?\s+unload|sysmon(64)?(\.exe)?\s+-u\b"), "CRITICAL AMSI/Defender/Sysmon tampering", null()),
+    if(match(c, "security\.cryptography|aesmanaged|createencryptor|cryptostream"), "CRITICAL encryption code", null()),
+    if(match(c, "win32_shadowcopy|vssadmin|wbadmin|bcdedit|cipher\s+/w"), "CRITICAL shadow copy/backup/wiping", null()),
+    if(match(c, "mimikatz|sekurlsa|comsvcs|minidump|lsass|get-gpppassword|pypykatz"), "CRITICAL credential dumping", null()),
+    if(match(c, "invoke-mimikatz|sharphound|bloodhound|powerup|powerview"), "CRITICAL offensive toolkit", null()),
+    if(match(c, "\s[-/]v(e\w*)?\s+2(\.0)?\b"), "CRITICAL powershell v2 downgrade", null()),
+    if(len(c) > 2000, "very long command", null()))
+| eval score=mvcount(reasons)
+| where like(mvjoin(reasons, ","), "%CRITICAL%") OR score>=2
+| table _time log_source host user Creator_Process_Name command reasons score
+| sort - score
