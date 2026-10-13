@@ -22,6 +22,50 @@ Install the **Splunk Add-on for Microsoft Windows** and the **Splunk Add-on for 
 > `` `powershell_logs` `` = `index=wineventlog source="XmlWinEventLog:Microsoft-Windows-PowerShell/Operational"`
 > `` `sysmon` `` = `index=sysmon source="XmlWinEventLog:Microsoft-Windows-Sysmon/Operational"`
 
+### 0.1 Check that the logs are arriving (run before saving any alert)
+
+```spl
+| tstats count where index=* (source=*PowerShell* OR sourcetype=*PowerShell* OR source=*Sysmon* OR sourcetype=*Sysmon*) earliest=-24h by index sourcetype source
+```
+
+```spl
+index=* (source="*PowerShell*" OR sourcetype="*PowerShell*") earliest=-24h
+| stats count dc(host) as hosts by index sourcetype EventCode
+```
+
+You want to see EventCode **4104** (script block), plus 4103 (module logging) and 400/800 (classic log).
+Then check the fields are extracted, because the detections depend on `ScriptBlockText`:
+
+```spl
+index=* EventCode=4104 earliest=-24h | head 10 | table _time host index sourcetype ScriptBlockText
+```
+
+End-to-end test: on a Windows machine run `Write-Output "splunk-test-12345"`, wait 1–2 minutes, then
+`index=* "splunk-test-12345"`.
+
+Find machines that are not sending PowerShell logs:
+
+```spl
+| tstats count where index=* earliest=-24h by host
+| join type=left host [| tstats count as ps_events where index=* (source=*PowerShell* OR sourcetype=*PowerShell*) earliest=-24h by host]
+| fillnull value=0 ps_events
+| where ps_events=0
+```
+
+If nothing comes back: on the endpoint open Event Viewer > *Applications and Services Logs > Microsoft > Windows >
+PowerShell > Operational* and look for 4104. If it's there, the forwarder isn't collecting it. Add this to
+`inputs.conf` on the Universal Forwarder and restart it:
+
+```ini
+[WinEventLog://Microsoft-Windows-PowerShell/Operational]
+disabled = 0
+renderXml = true
+index = wineventlog
+```
+
+If it's not in Event Viewer either, script block logging is off (see the GPO above, or set registry
+`HKLM\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging` `EnableScriptBlockLogging` = `1`).
+
 ---
 
 ## 1. Encoded PowerShell command (`-enc`, `-EncodedCommand`)
